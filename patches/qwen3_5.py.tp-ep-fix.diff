@@ -1,0 +1,339 @@
+--- /home/codderg/raid/models/escha-runtime/.venv/lib/python3.12/site-packages/sglang/srt/models/qwen3_5.py.bak	2026-08-15 19:41:16.721288655 -0300
++++ /home/codderg/raid/models/escha-runtime/.venv/lib/python3.12/site-packages/sglang/srt/models/qwen3_5.py	2026-08-16 17:53:24.585181954 -0300
+@@ -1266,6 +1266,18 @@
+ _W8A16_MAX_M = None
+ 
+ 
++def _tp_shard_2d(t: torch.Tensor, dim: int, rank: int, size: int) -> torch.Tensor:
++    """Slice a 2D or 1D tensor along `dim` into `size` equal chunks and return the
++    rank-th chunk. Used to shard int8-as-stored weights that Escha's install path
++    otherwise duplicates on every TP rank."""
++    if size == 1:
++        return t
++    total = t.shape[dim]
++    assert total % size == 0, f"tensor dim {dim} size {total} not divisible by tp {size}"
++    per = total // size
++    return t.narrow(dim, rank * per, per).contiguous()
++
++
+ class _W8A16LinearMethod:
+     """Weight-only-int8 apply for an attention projection kept int8 in VRAM."""
+ 
+@@ -1287,15 +1299,32 @@
+         y = y.reshape(*orig[:-1], y.shape[-1])
+         if bias is not None:
+             y = y + bias
++        # Row-parallel modules (out_proj, o_proj, down_proj) return per-rank
++        # PARTIAL outputs on purpose: every RowParallelLinear in this model is
++        # constructed with reduce_results=False, and the surrounding decoder
++        # block / LayerCommunicator issues the single all-reduce that combines
++        # attention+MoE+shared branches. Doing another all-reduce here would
++        # double the contribution of the int8 module and break outputs
++        # (measured: degenerate "The sea is a vast ocean of water" loop).
+         return y
+ 
+ 
+-def _install_int8_gdn(model, gdn_keep, logger) -> None:
++def _install_int8_gdn(model, gdn_keep, logger, config=None) -> None:
+     """Assign int8 in_proj_qkv / in_proj_z / out_proj on the GDN (linear_attn)
+     layers, free the fp16 weights, swap in the w8a16 apply. gdn_keep:
+-    {<...linear_attn>: {proj: (int8, scale)}}. The checkpoint tensors are already
+-    the full merged matrices ([8192,2048] qkv etc.), same [N,K] row-major layout
+-    escha_gemv expects. ~1.0 GB/step less dense read on 35B-A3B (30 GDN layers)."""
++    {<...linear_attn>: {proj: (int8, scale)}}. The checkpoint tensors are the
++    full merged matrices ([8192,2048] qkv, [4096,2048] z, [2048,4096] out), same
++    [N,K] row-major layout escha_gemv expects. Under TP>1 we slice each buffer to
++    the local rank before registering: in_proj_qkv/in_proj_z are column-parallel
++    (shard on dim=0 = output rows), out_proj is row-parallel (shard on dim=1 =
++    input columns) and gets an all-reduce after apply. ~1.0 GB/step less dense
++    read on 35B-A3B (30 GDN layers)."""
++    from sglang.srt.layers.dp_attention import (
++        get_attention_tp_rank,
++        get_attention_tp_size,
++    )
++    tp_rank = get_attention_tp_rank()
++    tp_size = get_attention_tp_size()
+     mods = dict(model.named_modules())
+ 
+     def _find(ap, leaf):
+@@ -1304,12 +1333,32 @@
+                 return mods[cand]
+         return None
+ 
+-    def _set(mod, i8, scale):
++    def _set(mod, i8, scale, row_parallel=False):
+         dev = mod.weight.device
+         del mod.weight
+         mod.register_buffer("weight_int8", i8.to(dev).contiguous(), persistent=False)
+         mod.register_buffer("weight_scale", scale.to(dev).float().contiguous(), persistent=False)
+         mod.quant_method = _W8A16LinearMethod()
++        mod._w8a16_row_parallel = row_parallel
++
++    # in_proj_qkv is a MergedColumnParallelLinear over [key_dim, key_dim, value_dim]
++    # (Q,K,V of the GDN). The checkpoint fuses them into ONE [key_dim+key_dim+
++    # value_dim, hidden] tensor. Under TP we must shard EACH sub-projection on
++    # dim=0 separately then concat — sharding the fused tensor as a whole would
++    # give a rank the "top half of Q, K and V" instead of "my slice of Q, K, V".
++    def _shard_gdn_qkv(t: torch.Tensor) -> torch.Tensor:
++        if tp_size == 1 or config is None:
++            return t
++        key_dim = config.linear_num_key_heads * config.linear_key_head_dim
++        value_dim = config.linear_num_value_heads * config.linear_value_head_dim
++        assert t.shape[0] == 2 * key_dim + value_dim, (
++            f"gdn qkv fused shape {t.shape[0]} != 2*{key_dim} + {value_dim}")
++        q, k, v = t.split([key_dim, key_dim, value_dim], dim=0)
++        return torch.cat([
++            _tp_shard_2d(q, 0, tp_rank, tp_size),
++            _tp_shard_2d(k, 0, tp_rank, tp_size),
++            _tp_shard_2d(v, 0, tp_rank, tp_size),
++        ], dim=0)
+ 
+     n = 0
+     for ap, projs in gdn_keep.items():
+@@ -1317,19 +1366,43 @@
+             if leaf not in projs:
+                 continue
+             mod = _find(ap, leaf)
+-            if mod is not None:
+-                _set(mod, projs[leaf][0], projs[leaf][1])
+-                n += 1
++            if mod is None:
++                continue
++            i8, sc = projs[leaf]
++            if leaf == "in_proj_qkv":
++                i8 = _shard_gdn_qkv(i8)
++                sc = _shard_gdn_qkv(sc.unsqueeze(1)).squeeze(1)
++                _set(mod, i8, sc, row_parallel=False)
++            elif leaf == "in_proj_z":
++                # ColumnParallelLinear, output_size=value_dim → shard rows.
++                i8 = _tp_shard_2d(i8, 0, tp_rank, tp_size)
++                sc = _tp_shard_2d(sc, 0, tp_rank, tp_size)
++                _set(mod, i8, sc, row_parallel=False)
++            else:  # out_proj: RowParallelLinear, shard input dim (columns).
++                i8 = _tp_shard_2d(i8, 1, tp_rank, tp_size)
++                # scale is per output row (untouched under row-parallel).
++                _set(mod, i8, sc, row_parallel=True)
++            n += 1
+         projs.clear()
+     torch.cuda.empty_cache()
+     logger.info("SGLANG_INT8_GDN: kept %d GDN (linear_attn) projections int8 "
+-                "(w8a16, fp32-accumulate)", n)
++                "(w8a16, fp32-accumulate, tp=%d)", n, tp_size)
+ 
+ 
+ def _install_int8_shexp(model, sh_keep, logger) -> None:
+     """Assign int8 shared-expert projections: gate|up concatenated -> gate_up_proj
+     (row order matches MergedColumnParallelLinear: gate first, then up), down ->
+-    down_proj. sh_keep: {<...mlp.shared_expert>: {proj: (int8, scale)}}."""
++    down_proj. sh_keep: {<...mlp.shared_expert>: {proj: (int8, scale)}}.
++    Under TP>1 the per-shard tensors are sliced BEFORE concat so each rank ends
++    up with its slice of gate + its slice of up, matching what the fp16-path
++    MergedColumnParallelLinear weight_loader would have produced. down_proj is
++    row-parallel: shard the input dim and add an all-reduce in apply."""
++    from sglang.srt.distributed import (
++        get_tensor_model_parallel_rank,
++        get_tensor_model_parallel_world_size,
++    )
++    tp_rank = get_tensor_model_parallel_rank()
++    tp_size = get_tensor_model_parallel_world_size()
+     mods = dict(model.named_modules())
+ 
+     def _find(ap, leaf):
+@@ -1338,29 +1411,37 @@
+                 return mods[cand]
+         return None
+ 
+-    def _set(mod, i8, scale):
++    def _set(mod, i8, scale, row_parallel=False):
+         dev = mod.weight.device
+         del mod.weight
+         mod.register_buffer("weight_int8", i8.to(dev).contiguous(), persistent=False)
+         mod.register_buffer("weight_scale", scale.to(dev).float().contiguous(), persistent=False)
+         mod.quant_method = _W8A16LinearMethod()
++        mod._w8a16_row_parallel = row_parallel
+ 
+     n = 0
+     for ap, projs in sh_keep.items():
+         gu = _find(ap, "gate_up_proj")
+         if gu is not None and "gate_proj" in projs and "up_proj" in projs:
+-            i8 = torch.cat([projs["gate_proj"][0], projs["up_proj"][0]], dim=0)
+-            sc = torch.cat([projs["gate_proj"][1], projs["up_proj"][1]], dim=0)
+-            _set(gu, i8, sc)
++            g_i, g_s = projs["gate_proj"]
++            u_i, u_s = projs["up_proj"]
++            g_i = _tp_shard_2d(g_i, 0, tp_rank, tp_size)
++            u_i = _tp_shard_2d(u_i, 0, tp_rank, tp_size)
++            g_s = _tp_shard_2d(g_s, 0, tp_rank, tp_size)
++            u_s = _tp_shard_2d(u_s, 0, tp_rank, tp_size)
++            _set(gu, torch.cat([g_i, u_i], dim=0), torch.cat([g_s, u_s], dim=0),
++                 row_parallel=False)
+             n += 1
+         dn = _find(ap, "down_proj")
+         if dn is not None and "down_proj" in projs:
+-            _set(dn, projs["down_proj"][0], projs["down_proj"][1])
++            d_i, d_s = projs["down_proj"]
++            d_i = _tp_shard_2d(d_i, 1, tp_rank, tp_size)  # row-parallel: shard input dim
++            _set(dn, d_i, d_s, row_parallel=True)
+             n += 1
+         projs.clear()
+     torch.cuda.empty_cache()
+     logger.info("SGLANG_INT8_SHEXP: kept %d shared-expert projections int8 "
+-                "(w8a16, fp32-accumulate)", n)
++                "(w8a16, fp32-accumulate, tp=%d)", n, tp_size)
+ 
+ 
+ # Shared int8-as-stored policy for BOTH the dense and MoE escha paths.
+@@ -1397,7 +1478,16 @@
+ 
+ def _install_int8_attn(model, attn_keep, logger) -> None:
+     """Assign concatenated int8 q/k/v -> qkv_proj and int8 o -> o_proj, free the
+-    fp16 weight, swap in the w8a16 apply. attn_keep: {<...self_attn>: {proj: (int8, scale)}}."""
++    fp16 weight, swap in the w8a16 apply. attn_keep: {<...self_attn>: {proj: (int8, scale)}}.
++    Under TP>1 each of q/k/v is sharded on dim=0 BEFORE concat so the resulting
++    qkv matches what QKVParallelLinear expects per rank (q_per_rank + k_per_rank
++    + v_per_rank rows). o_proj is row-parallel: shard input dim + all-reduce."""
++    from sglang.srt.layers.dp_attention import (
++        get_attention_tp_rank,
++        get_attention_tp_size,
++    )
++    tp_rank = get_attention_tp_rank()
++    tp_size = get_attention_tp_size()
+     mods = dict(model.named_modules())
+ 
+     def _find(ap, leaf):
+@@ -1412,29 +1502,42 @@
+                 return mods[cand]
+         return None
+ 
+-    def _set(mod, i8, scale):
++    def _set(mod, i8, scale, row_parallel=False):
+         dev = mod.weight.device
+         del mod.weight  # free the preallocated fp16 weight
+         mod.register_buffer("weight_int8", i8.to(dev).contiguous(), persistent=False)
+         mod.register_buffer("weight_scale", scale.to(dev).float().contiguous(), persistent=False)
+         mod.quant_method = _W8A16LinearMethod()
++        mod._w8a16_row_parallel = row_parallel
+ 
+     n = 0
+     for ap, projs in attn_keep.items():
+         qkv = _find(ap, "qkv_proj")
+         if qkv is not None and all(p in projs for p in ("q_proj", "k_proj", "v_proj")):
+-            i8 = torch.cat([projs["q_proj"][0], projs["k_proj"][0], projs["v_proj"][0]], dim=0)
+-            sc = torch.cat([projs["q_proj"][1], projs["k_proj"][1], projs["v_proj"][1]], dim=0)
+-            _set(qkv, i8, sc)
++            i8_parts, sc_parts = [], []
++            for p in ("q_proj", "k_proj", "v_proj"):
++                pi, ps = projs[p]
++                # k/v may hold fewer heads than tp_size (GQA with num_kv_heads<tp_size).
++                # In that case QKVParallelLinear replicates the k/v shard, so we do too.
++                if pi.shape[0] % tp_size == 0:
++                    i8_parts.append(_tp_shard_2d(pi, 0, tp_rank, tp_size))
++                    sc_parts.append(_tp_shard_2d(ps, 0, tp_rank, tp_size))
++                else:
++                    i8_parts.append(pi.contiguous())
++                    sc_parts.append(ps.contiguous())
++            _set(qkv, torch.cat(i8_parts, dim=0), torch.cat(sc_parts, dim=0),
++                 row_parallel=False)
+             n += 1
+         o = _find(ap, "o_proj")
+         if o is not None and "o_proj" in projs:
+-            _set(o, projs["o_proj"][0], projs["o_proj"][1])
++            o_i, o_s = projs["o_proj"]
++            o_i = _tp_shard_2d(o_i, 1, tp_rank, tp_size)  # row-parallel: shard input dim
++            _set(o, o_i, o_s, row_parallel=True)
+             n += 1
+         projs.clear()  # drop the per-shard source tensors so they free (the merged qkv is a copy)
+     torch.cuda.empty_cache()  # return the freed fp16 weights + source shards before KV-pool sizing
+     logger.info("SGLANG_INT8_ATTN: kept %d/%d attention layers' projections int8 "
+-                "(w8a16, fp32-accumulate)", n, len(attn_keep) * 2)
++                "(w8a16, fp32-accumulate, tp=%d)", n, len(attn_keep) * 2, tp_size)
+ 
+ 
+ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1480,6 +1583,12 @@
+             weights = [(n, w) for n, w in weights if "visual" not in n]
+             logger.info("SGLANG_VLM_TEXT_ONLY: dropped %d visual weights", n_vis)
+         if any(".mlp.experts." in n and ".escha_" in n for n, _ in weights):
++            from sglang.srt.distributed import (
++                get_moe_expert_parallel_rank,
++                get_moe_expert_parallel_world_size,
++            )
++            _ep_size = get_moe_expert_parallel_world_size()
++            _ep_rank = get_moe_expert_parallel_rank()
+             _qp = dict(self.named_parameters(remove_duplicate=False))
+             _nloaded, _rest = 0, []
+             for _n, _w in weights:
+@@ -1492,12 +1601,23 @@
+                             _pn = _nm.replace(f"{_proj}.escha_", f"{_proj}_escha_")
+                             break
+                     if _pn is not None and _pn in _qp:
++                        # EP: under expert parallelism the local param holds only
++                        # num_local_experts = num_experts / ep_size experts (dim 0),
++                        # but the checkpoint tensor stacks ALL num_experts. Slice
++                        # dim 0 to this rank's expert range BEFORE the shape check;
++                        # otherwise both ranks would load experts [0:num_local),
++                        # leaving experts [num_local:num_experts) completely missing.
++                        if (_ep_size > 1 and _w.dim() >= 1
++                                and _w.shape[0] != _qp[_pn].data.shape[0]
++                                and _w.shape[0] == _qp[_pn].data.shape[0] * _ep_size):
++                            _num_local = _qp[_pn].data.shape[0]
++                            _w = _w[_ep_rank * _num_local:(_ep_rank + 1) * _num_local]
+                         if _qp[_pn].data.shape == _w.shape:
+                             _qp[_pn].data.copy_(_w)
+                         else:
+                             # mixed-bit: a K3 down_proj code (last dim 48) does not fit the
+                             # uniform-K placeholder (32) create_weights allocated -> replace it.
+-                            _qp[_pn].data = _w.to(_qp[_pn].data.device, _qp[_pn].data.dtype)
++                            _qp[_pn].data = _w.to(_qp[_pn].data.device, _qp[_pn].data.dtype).contiguous()
+                         _nloaded += 1
+                     else:
+                         logger.warning("eschamoe: unmapped expert key %s -> %s", _n, _pn)
+@@ -1561,12 +1681,36 @@
+                         elif _int8_embed and _b.endswith("embed_tokens"):
+                             _emb = self.model.embed_tokens
+                             _dev = _emb.weight.device
++                            # VocabParallelEmbedding shards the vocab across TP ranks:
++                            # _emb.weight is [vocab_per_rank, hidden]. The checkpoint stores
++                            # the FULL [vocab, hidden] tensor, so under TP>1 we must slice to
++                            # this rank's vocab range BEFORE registering — otherwise every
++                            # rank looks up rows in the full table using local indices, which
++                            # is nonsense (garbage token embeddings → degenerate output).
++                            _emb_i = _ibuf[_b]["i"]
++                            _emb_s = _ibuf[_b]["s"]
++                            _local_vocab = _emb.weight.shape[0]
++                            if _emb_i.shape[0] != _local_vocab:
++                                assert _emb_i.shape[0] % _local_vocab == 0, (
++                                    f"embed_tokens int8 vocab {_emb_i.shape[0]} not a multiple "
++                                    f"of local vocab {_local_vocab}")
++                                _tp_size = _emb_i.shape[0] // _local_vocab
++                                _tp_rank = getattr(_emb, "tp_rank", None)
++                                if _tp_rank is None:
++                                    from sglang.srt.distributed import (
++                                        get_tensor_model_parallel_rank,
++                                    )
++                                    _tp_rank = get_tensor_model_parallel_rank()
++                                _emb_i = _emb_i[_tp_rank * _local_vocab:
++                                                (_tp_rank + 1) * _local_vocab]
++                                _emb_s = _emb_s[_tp_rank * _local_vocab:
++                                                (_tp_rank + 1) * _local_vocab]
+                             del _emb.weight   # free the preallocated fp16 table (~1 GB)
+                             _emb.register_buffer(
+-                                "weight_int8", _ibuf[_b]["i"].to(_dev).contiguous(),
++                                "weight_int8", _emb_i.to(_dev).contiguous(),
+                                 persistent=False)
+                             _emb.register_buffer(
+-                                "weight_scale", _ibuf[_b]["s"].to(_dev).float().contiguous(),
++                                "weight_scale", _emb_s.to(_dev).float().contiguous(),
+                                 persistent=False)
+                             logger.info(
+                                 "SGLANG_INT8_EMBED: embed_tokens kept int8 (%s x %s), "
+@@ -1594,7 +1738,8 @@
+         if _attn_keep:
+             _install_int8_attn(self, _attn_keep, logger)
+         if _gdn_keep:
+-            _install_int8_gdn(self, _gdn_keep, logger)
++            _install_int8_gdn(self, _gdn_keep, logger,
++                              config=getattr(self.config, "text_config", self.config))
+         if _shexp_keep:
+             _install_int8_shexp(self, _shexp_keep, logger)
+         stacked_params_mapping = [
